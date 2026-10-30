@@ -99,6 +99,17 @@ async function defragBlob(blob, tags) {
   withFiles(source, writer, (i, o) => invoke('media_defrag', i, o, 1, tags || new Uint8Array(0)));
   return { blob: new Blob(parts, { type: blob.type }), size: length, crc: writer.crc() };
 }
+// MV variant of defragBlob: uses song=0 (interleaved MV layout) and returns { blob, size, crc }.
+// Used as a fallback when OPFS is unavailable (plain HTTP / non-secure context).
+async function defragMVBlob(blob, tags, crc) {
+  const bytes = new Uint8Array(await blob.arrayBuffer()), parts = [];
+  let length = 0;
+  const source = { getSize: () => bytes.length, read: (view, { at }) => { const part = bytes.subarray(at, at + view.length); view.set(part); return part.length; } };
+  const inner = { getSize: () => length, write: (view, { at }) => { if (at !== length) return -1; parts.push(view.slice()); length += view.length; return view.length; } };
+  const writer = crc ? crcWriter(inner) : inner;
+  withFiles(source, writer, (i, o) => invoke('media_defrag', i, o, 0, tags || new Uint8Array(0)));
+  return { blob: new Blob(parts, { type: 'video/mp4' }), size: length, crc: crc ? writer.crc() : null };
+}
 
 const methods = {
   // challenge(uri, drm?) -> { session, uri, challenge }: drm 'widevine' (CENC songs) or PlayReady by default (MVs).
@@ -111,6 +122,8 @@ const methods = {
   release: name => { invoke('media_release', name); },
   // defrag(input, output, tags?, crc?) -> { size, crc }: the MV layout; crc is null unless asked for.
   defrag: (input, output, tags, crc) => defrag(0, input, output, undefined, tags, !!crc),
+  // defragMV(blob, tags?, crc?) -> { blob, size, crc }: in-memory fallback when OPFS is unavailable.
+  defragMV: (blob, tags, crc) => defragMVBlob(blob, tags, !!crc),
   // defragSong(blob, tags) -> { blob, size, crc } or defragSong(input, output, dir, tags) -> { size, crc }:
   // the reference song layout; tags (Uint8Array, may be omitted) are the ilst items (see mp4-tags.mjs).
   defragSong: (...args) => args[0] instanceof Blob ? defragBlob(args[0], args[1]) : defrag(1, ...args),

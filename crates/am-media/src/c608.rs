@@ -16,6 +16,39 @@ use crate::{bail, Result};
 /// CEA-608 padding byte (0x00 with odd parity).
 const NULL_PAIR: u8 = 0x80;
 
+/// CEA-608 sends one byte pair per frame slot, 30000/1001 pairs a second.
+const PAIRS_PER_SECOND: (u64, u64) = (30000, 1001);
+
+/// Position, among the byte pairs of a caption sample, of its end-of-caption command.
+///
+/// A pop-on caption is loaded off screen and appears when that command arrives, which in a
+/// cue-level sample (a whole caption with its erase and flip, as Apple writes them) is
+/// near the end of the pairs, a second or more after the sample's stamp. Samples without
+/// the command (erase, null padding, roll-up) have no such position.
+pub fn flip_pair(sample: &[u8]) -> Option<u32> {
+    let mut at = 0;
+    while at + 8 <= sample.len() {
+        let size = be32(sample, at) as usize;
+        if size < 8 || at + size > sample.len() {
+            return None;
+        }
+        if matches!(&sample[at + 4..at + 8], b"cdat" | b"cdt2") {
+            let flip = sample[at + 8..at + size].as_chunks::<2>().0.iter().position(|p| matches!(p[0] & 0x7f, 0x14 | 0x15 | 0x1c | 0x1d) && p[1] & 0x7f == 0x2f);
+            if let Some(flip) = flip {
+                return Some(flip as u32);
+            }
+        }
+        at += size;
+    }
+    None
+}
+
+/// How long `pairs` byte pairs take to send, in ticks of `timescale`.
+pub fn pairs_to_ticks(pairs: u32, timescale: u32) -> u64 {
+    let (num, den) = PAIRS_PER_SECOND;
+    (pairs as u64 * den * timescale as u64 + num / 2) / num
+}
+
 /// FFmpeg's c608 sample rules (libavformat/mov.c get_eia608_packet): samples of
 /// at most 8 bytes are passed through, larger ones need at least 10 bytes and
 /// consist of atoms carrying whole byte pairs. A tail shorter than 10 bytes is ignored.

@@ -10,11 +10,12 @@
 //! - [`Options::mv`] reproduces the reference mv.Mux output
 //!   (`DefragmentMP4WithFtyp`): the same layout with an `isom` ftyp.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::bmff::{self, be32, put32, put64, version_flags, Atom, Body, FourCC};
+use crate::c608;
 use crate::cenc::tkhd_track_id;
-use crate::frag::{sgpd_grouping_type, traf_tfhd, Sample, Sbgp, Tfhd, Trex, Trun, TRUN_DATA_OFFSET};
+use crate::frag::{sgpd_grouping_type, tfdt_time, traf_tfhd, Sample, Sbgp, Tfhd, Trex, Trun, TRUN_DATA_OFFSET};
 use crate::readahead::{Reader, Sink, Source};
 use crate::{bail, Error, Result};
 
@@ -193,8 +194,9 @@ pub fn defragment<S: Source, W: Sink>(input: S, output: &mut W, options: &Option
         bail!("fragmented MP4 has no mvex");
     }
 
-    let tracks = collect_tracks(&moov, &parsed.fragments, &parsed.mdats)
+    let mut tracks = collect_tracks(&moov, &parsed.fragments, &parsed.mdats)
         .map_err(|e| e.context("collect fragmented samples"))?;
+    retime_captions(&mut r, &moov, &mut tracks).map_err(|e| e.context("retime captions"))?;
     validate_source_ranges(&tracks).map_err(|e| e.context("validate source ranges"))?;
     build_progressive_moov(&mut moov, &tracks).map_err(|e| e.context("build progressive moov"))?;
     moov.children_mut().retain(|c| &c.kind != b"mvex");
@@ -254,8 +256,11 @@ fn collect_tracks(moov: &Atom, fragments: &[Fragment], mdats: &[Mdat]) -> Result
             bail!("track {id} has no trex");
         }
     }
+    // Caption samples are sparse: their durations rarely add up to the whole fragment,
+    // so their tracks follow the fragments' tfdt instead of plain concatenation.
+    let captions: HashSet<u32> = c608::tracks(moov)?.into_keys().collect();
     for (i, frag) in fragments.iter().enumerate() {
-        collect_fragment(frag, &mdats[frag.mdat], frag.mdat, &trexs, &mut by_id)
+        collect_fragment(frag, &mdats[frag.mdat], frag.mdat, &trexs, &captions, &mut by_id)
             .map_err(|e| e.context(&format!("segment 0 fragment {i}")))?;
     }
     order
@@ -275,6 +280,7 @@ fn collect_fragment(
     mdat: &Mdat,
     mdat_index: usize,
     trexs: &HashMap<u32, Trex>,
+    captions: &HashSet<u32>,
     tracks: &mut HashMap<u32, Track>,
 ) -> Result<()> {
     for traf in frag.moof.all(b"traf") {
@@ -285,6 +291,11 @@ fn collect_fragment(
         let description = tfhd.description.or(trex.map(|t| t.description)).unwrap_or(0);
         if description == 0 {
             bail!("track {id} has sample description index 0");
+        }
+        if captions.contains(&id) {
+            if let Some(tfdt) = traf.child(b"tfdt") {
+                anchor_to_tfdt(td, tfdt_time(tfdt)?);
+            }
         }
         let fragment_start = td.samples.len();
         for (trun_index, trun) in traf.all(b"trun").enumerate() {
@@ -316,6 +327,84 @@ fn collect_fragment(
         }
     }
     Ok(())
+}
+
+/// Largest caption sample that is read to find its end-of-caption command.
+const MAX_CAPTION_SAMPLE: u64 = 64 << 10;
+
+/// Stamps every caption sample with the time its caption appears.
+///
+/// CEA-608 is sent one byte pair per frame slot, so Apple's cue-level caption sample, stamped
+/// when its first pair goes out, only shows the caption once its end-of-caption command at the
+/// end of the pairs has been sent: about a second later for a lyric line. A player takes a
+/// whole sample at its stamp, so every caption came up that much before the audio. Each sample
+/// that has the command moves to where the command falls, and the sample before it stretches
+/// to match, so the track keeps its length. Single-pair samples are not moved.
+fn retime_captions<S: Source>(r: &mut Reader<S>, moov: &Atom, tracks: &mut [Track]) -> Result<()> {
+    let captions = c608::tracks(moov)?;
+    if captions.is_empty() {
+        return Ok(());
+    }
+    for td in tracks.iter_mut().filter(|t| captions.contains_key(&t.id)) {
+        let trak = moov.all(b"trak").find(|t| tkhd_track_id(t).is_ok_and(|id| id == td.id));
+        let Some(timescale) = trak.map(trak_timescale).transpose()? else { continue };
+        let mut delays = Vec::with_capacity(td.samples.len());
+        for chunk in &td.chunks {
+            let mut at = chunk.offset;
+            for _ in 0..chunk.samples {
+                let size = td.samples.get(delays.len()).map(|s| s.size as u64).ok_or_else(|| Error::new("caption chunk has more samples than the track"))?;
+                let delay = if (1..=MAX_CAPTION_SAMPLE).contains(&size) {
+                    c608::flip_pair(&r.read_vec(at, size)?).map_or(0, |pairs| c608::pairs_to_ticks(pairs, timescale))
+                } else {
+                    0
+                };
+                delays.push(delay);
+                at += size;
+            }
+        }
+        if delays.len() != td.samples.len() {
+            bail!("caption track {} has samples outside its chunks", td.id);
+        }
+        if delays.iter().all(|&d| d == 0) {
+            continue;
+        }
+        let mut stamp = 0u64;
+        let total: u64 = td.samples.iter().map(|s| s.duration as u64).sum();
+        let mut starts = Vec::with_capacity(delays.len());
+        for (k, (sample, delay)) in td.samples.iter().zip(&delays).enumerate() {
+            // The track starts at zero; later samples stay in order, one tick apart at least.
+            let at = if k == 0 { 0 } else { (stamp + delay).max(starts[k - 1] + 1) };
+            starts.push(at);
+            stamp += sample.duration as u64;
+        }
+        for k in 0..starts.len() {
+            let end = starts.get(k + 1).copied().unwrap_or_else(|| total.max(starts[k] + 1));
+            td.samples[k].duration = u32::try_from(end - starts[k]).unwrap_or(u32::MAX);
+        }
+        td.duration = td.samples.iter().map(|s| s.duration as u64).sum();
+    }
+    Ok(())
+}
+
+/// Puts the next fragment of a caption track at its decode time `tfdt`.
+///
+/// A progressive track has no per-fragment timestamps: the time of a sample is the sum of
+/// the durations before it. Caption samples only exist where there is caption data, so
+/// that sum falls behind the real timeline and every later caption appears early against
+/// audio and video. A gap is closed by lengthening the previous sample (a caption packet
+/// is delivered at its start, so only the next one moves); an overlap shortens it, never
+/// below one tick. The first fragment of a track has nothing to adjust.
+fn anchor_to_tfdt(td: &mut Track, tfdt: u64) {
+    let Some(last) = td.samples.last_mut() else { return };
+    if tfdt >= td.duration {
+        let add = (tfdt - td.duration).min((u32::MAX - last.duration) as u64);
+        last.duration += add as u32;
+        td.duration += add;
+    } else {
+        let cut = (td.duration - tfdt).min(last.duration.saturating_sub(1) as u64);
+        last.duration -= cut as u32;
+        td.duration -= cut;
+    }
 }
 
 fn collect_sample_groups(td: &mut Track, sbgp: &Sbgp, has_sgpd: bool, fragment_start: usize) -> Result<()> {
@@ -436,6 +525,7 @@ fn build_progressive_moov(moov: &mut Atom, tracks: &[Track]) -> Result<()> {
     let mvhd = moov.req(&[b"mvhd"])?;
     let movie_timescale = be32(mvhd.bytes(), if mvhd.version() == 1 { 20 } else { 12 }) as u64;
     let by_id: HashMap<u32, &Track> = tracks.iter().map(|t| (t.id, t)).collect();
+    align_caption_edits(moov, &by_id)?;
     let mut max_duration = 0u64;
     for trak in moov.children_mut().iter_mut().filter(|c| &c.kind == b"trak") {
         let id = tkhd_track_id(trak)?;
@@ -454,6 +544,73 @@ fn build_progressive_moov(moov: &mut Atom, tracks: &[Track]) -> Result<()> {
         max_duration = max_duration.max(duration);
     }
     set_versioned(moov.req_mut(&[b"mvhd"])?, 16, 24, max_duration);
+    Ok(())
+}
+
+/// Media time the first non-empty edit of a track starts at, in the track's timescale.
+fn first_edit_media_time(trak: &Atom) -> Option<u64> {
+    let elst = trak.path(&[b"edts", b"elst"])?;
+    let b = elst.bytes();
+    let v1 = elst.version() == 1;
+    let (entry, dur) = if v1 { (20, 8) } else { (12, 4) };
+    let n = if b.len() >= 8 { be32(b, 4) as usize } else { 0 };
+    for i in 0..n {
+        let at = 8 + i * entry;
+        if b.len() < at + entry {
+            return None;
+        }
+        let media_time = if v1 { bmff::be64(b, at + dur) as i64 } else { be32(b, at + dur) as i32 as i64 };
+        if media_time >= 0 {
+            return Some(media_time as u64);
+        }
+    }
+    None
+}
+
+fn is_video(trak: &Atom) -> bool {
+    trak.path(&[b"mdia", b"hdlr"]).is_some_and(|h| h.bytes().get(8..12) == Some(b"vide"))
+}
+
+/// Gives every caption track the video track's edit.
+///
+/// A player applies a progressive file's edit lists but MSE playback ignores them. Apple's
+/// caption track carries its own start offset that only makes sense on its fragmented
+/// timeline, where the captions already line up with the video; applying it in the MP4
+/// shows every caption early against audio and video by that offset. Captions are timed
+/// like the video frames they belong to, so they take the same edit as the video track
+/// (none if the video has none).
+fn align_caption_edits(moov: &mut Atom, durations: &HashMap<u32, &Track>) -> Result<()> {
+    let captions = c608::tracks(moov)?;
+    if captions.is_empty() {
+        return Ok(());
+    }
+    let Some(video) = moov.all(b"trak").find(|t| is_video(t)) else { return Ok(()) };
+    let (video_time, video_scale) = (first_edit_media_time(video).unwrap_or(0), trak_timescale(video)? as u64);
+    for trak in moov.children_mut().iter_mut().filter(|c| &c.kind == b"trak") {
+        let id = tkhd_track_id(trak)?;
+        let Some(td) = durations.get(&id).filter(|_| captions.contains_key(&id)) else { continue };
+        let scale = trak_timescale(trak)? as u64;
+        let media_time = scale_duration(video_time, video_scale, scale)?;
+        let children = trak.children_mut();
+        children.retain(|c| &c.kind != b"edts");
+        // An edit that starts beyond the track's end would be rejected below.
+        if media_time == 0 || media_time >= td.duration {
+            continue;
+        }
+        // A zero-duration placeholder, completed from the media duration like the other tracks'.
+        let mut elst = Vec::new();
+        if media_time <= i32::MAX as u64 {
+            elst.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
+            elst.extend_from_slice(&(media_time as u32).to_be_bytes());
+        } else {
+            elst.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 1]);
+            elst.extend_from_slice(&0u64.to_be_bytes());
+            elst.extend_from_slice(&media_time.to_be_bytes());
+        }
+        elst.extend_from_slice(&[0, 1, 0, 0]);
+        let at = children.iter().position(|c| &c.kind == b"mdia").unwrap_or(children.len());
+        children.insert(at, Atom::tree(b"edts", Vec::new(), vec![Atom::data(b"elst", elst)]));
+    }
     Ok(())
 }
 
@@ -1096,6 +1253,203 @@ mod tests {
             last = c.last().unwrap().0;
             check_samples(&out, trak, spec);
         }
+    }
+
+    /// stts entries (count, delta) of a trak.
+    fn stts(trak: &Atom) -> Vec<(u32, u32)> {
+        let b = trak.path(&[b"mdia", b"minf", b"stbl", b"stts"]).unwrap().bytes();
+        (0..be32(b, 4) as usize).map(|i| (be32(b, 8 + 8 * i), be32(b, 12 + 8 * i))).collect()
+    }
+
+    /// Source with a media track (id 1) and a c608 caption track (id 2) that shares its
+    /// fragments, like an Apple MV. `captions` lists, per fragment, the caption tfdt and
+    /// sample durations; the fragment covers 2000 ticks of the media track.
+    fn with_captions(captions: &[(u64, &[u32])]) -> Vec<u8> {
+        let tracks = [
+            TrackSpec { id: 1, timescale: 1000, entry: entry(b"mp4a") },
+            TrackSpec { id: 2, timescale: 1000, entry: entry(b"c608") },
+        ];
+        let mut out = init(&tracks);
+        for (n, (tfdt, durations)) in captions.iter().enumerate() {
+            let media = (0..2).map(|i| (1000, 0, sample_data(1, n * 2 + i))).collect();
+            let cc = durations.iter().enumerate().map(|(i, d)| (*d, 0, sample_data(2, n * 8 + i))).collect();
+            let runs = [Run { track: 1, start_time: n as u64 * 2000, samples: media }, Run { track: 2, start_time: *tfdt, samples: cc }];
+            out.extend(fragment(n as u32 + 1, &runs, &|_| Vec::new()));
+        }
+        out
+    }
+
+    type Stts = Vec<(u32, u32)>;
+
+    /// (media stts, caption stts, caption mdhd duration) of the defragmented source.
+    fn defragmented_captions(captions: &[(u64, &[u32])]) -> (Stts, Stts, u32) {
+        let mut out = Vec::new();
+        defragment(&with_captions(captions)[..], &mut out, &Options::mv()).unwrap();
+        let atoms = bmff::parse(&out).unwrap();
+        let traks: Vec<&Atom> = atoms[1].all(b"trak").collect();
+        let mdhd = traks[1].path(&[b"mdia", b"mdhd"]).unwrap().bytes();
+        (stts(traks[0]), stts(traks[1]), be32(mdhd, 16))
+    }
+
+    /// Caption samples are sparse. Plain concatenation made every later caption appear
+    /// early against audio and video; the gap now goes into the previous sample.
+    #[test]
+    fn caption_track_follows_fragment_decode_times() {
+        // Fragment 2 starts at 2000 and fragment 3 at 4000, but each caption run is shorter.
+        let (media, cc, duration) = defragmented_captions(&[(0, &[500, 300]), (2000, &[400]), (4000, &[600, 100])]);
+        assert_eq!(media, [(6, 1000)], "media tracks keep their own durations");
+        // 500, 300 + 1200 (up to 2000), 400 + 1600 (up to 4000), 600, 100.
+        assert_eq!(cc, [(1, 500), (1, 1500), (1, 2000), (1, 600), (1, 100)]);
+        assert_eq!(duration, 4700);
+    }
+
+    /// Samples that overrun the next fragment are trimmed back, but never to zero.
+    #[test]
+    fn caption_track_overlap_is_trimmed() {
+        let (_, cc, duration) = defragmented_captions(&[(0, &[1500, 1000]), (2000, &[300])]);
+        // 1500 + 1000 reaches 2500, the next fragment starts at 2000: the last sample drops to 500.
+        assert_eq!(cc, [(1, 1500), (1, 500), (1, 300)]);
+        assert_eq!(duration, 2300);
+        let (_, cc, _) = defragmented_captions(&[(0, &[100, 1500]), (50, &[300])]);
+        assert_eq!(cc, [(1, 100), (1, 1), (1, 300)], "an overlap larger than the sample leaves one tick");
+    }
+
+    /// Fragments without a caption traf at all leave a whole fragment of silence.
+    #[test]
+    fn caption_track_gap_over_fragments_without_captions() {
+        let tracks = [TrackSpec { id: 1, timescale: 1000, entry: entry(b"mp4a") }, TrackSpec { id: 2, timescale: 1000, entry: entry(b"c608") }];
+        let mut src = init(&tracks);
+        let media = |n: usize| (0..2).map(|i| (1000, 0, sample_data(1, n * 2 + i))).collect::<Vec<_>>();
+        let cc = |i: usize| vec![(400u32, 0u32, sample_data(2, i))];
+        src.extend(fragment(1, &[Run { track: 1, start_time: 0, samples: media(0) }, Run { track: 2, start_time: 0, samples: cc(0) }], &|_| Vec::new()));
+        src.extend(fragment(2, &[Run { track: 1, start_time: 2000, samples: media(1) }], &|_| Vec::new()));
+        src.extend(fragment(3, &[Run { track: 1, start_time: 4000, samples: media(2) }, Run { track: 2, start_time: 4000, samples: cc(1) }], &|_| Vec::new()));
+        let mut out = Vec::new();
+        defragment(&src[..], &mut out, &Options::mv()).unwrap();
+        let atoms = bmff::parse(&out).unwrap();
+        let cc_trak = atoms[1].all(b"trak").nth(1).unwrap();
+        assert_eq!(stts(cc_trak), [(1, 4000), (1, 400)]);
+    }
+
+    /// An init with a video track (id 1, `video_edit` media time) and a c608 track (id 2,
+    /// `caption_edit` media time); both timescales are 1000, the video lasts 4000 ticks and the
+    /// captions `caption_samples` thousand.
+    fn with_edits(video: bool, video_edit: Option<u32>, caption_edit: Option<u32>, caption_samples: usize) -> Vec<u8> {
+        let tracks = [
+            TrackSpec { id: 1, timescale: 1000, entry: entry(b"mp4a") },
+            TrackSpec { id: 2, timescale: 1000, entry: entry(b"c608") },
+        ];
+        let mut head = init(&tracks);
+        if video {
+            let at = head.windows(4).position(|w| w == b"soun").unwrap();
+            head[at..at + 4].copy_from_slice(b"vide");
+        }
+        let mut atoms = bmff::parse(&head).unwrap();
+        let moov = atoms.iter_mut().find(|a| &a.kind == b"moov").unwrap();
+        for (trak, edit) in moov.children_mut().iter_mut().filter(|c| &c.kind == b"trak").zip([video_edit, caption_edit]) {
+            if let Some(media_time) = edit {
+                let elst = [vec![0u8; 4], 1u32.to_be_bytes().to_vec(), vec![0; 4], media_time.to_be_bytes().to_vec(), vec![0, 1, 0, 0]].concat();
+                let at = trak.children().iter().position(|c| &c.kind == b"mdia").unwrap();
+                trak.children_mut().insert(at, Atom::tree(b"edts", Vec::new(), vec![Atom::data(b"elst", elst)]));
+            }
+        }
+        let mut out = Vec::new();
+        atoms.iter().for_each(|a| a.encode(&mut out));
+        let media = (0..4).map(|i| (1000, 0, sample_data(1, i))).collect();
+        let cc = (0..caption_samples).map(|i| (1000, 0, sample_data(2, i))).collect();
+        out.extend(fragment(1, &[Run { track: 1, start_time: 0, samples: media }, Run { track: 2, start_time: 0, samples: cc }], &|_| Vec::new()));
+        out
+    }
+
+    /// (media_time, segment_duration) of a trak's single edit, if it has an edit list.
+    fn edit(trak: &Atom) -> Option<(u32, u32)> {
+        let b = trak.path(&[b"edts", b"elst"])?.bytes();
+        assert_eq!(be32(b, 4), 1);
+        Some((be32(b, 12), be32(b, 8)))
+    }
+
+    fn edits(source: &[u8]) -> Vec<Option<(u32, u32)>> {
+        let mut out = Vec::new();
+        defragment(source, &mut out, &Options::mv()).unwrap();
+        bmff::parse(&out).unwrap()[1].all(b"trak").map(edit).collect()
+    }
+
+    /// MSE playback ignores edit lists and a player applies them, so a caption track's
+    /// own start offset must not shift it against the video, which has its own.
+    #[test]
+    fn caption_track_takes_the_video_edit() {
+        assert_eq!(edits(&with_edits(true, Some(500), Some(1000), 4)), [Some((500, 3500)), Some((500, 3500))]);
+        assert_eq!(edits(&with_edits(true, Some(500), None, 4)), [Some((500, 3500)), Some((500, 3500))], "captions without an edit get the video's");
+        assert_eq!(edits(&with_edits(true, None, Some(1000), 4)), [None, None], "no video edit: the caption offset is dropped");
+        assert_eq!(edits(&with_edits(true, Some(3500), Some(1000), 2))[1], None, "an edit beyond the captions' end is not written");
+    }
+
+    #[test]
+    fn caption_edit_is_kept_without_a_video_track() {
+        assert_eq!(edits(&with_edits(false, Some(500), Some(1000), 4)), [Some((500, 3500)), Some((1000, 3000))]);
+    }
+
+    fn cdat(pairs: &[[u8; 2]]) -> Vec<u8> {
+        let mut out = ((8 + pairs.len() * 2) as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(b"cdat");
+        pairs.iter().for_each(|p| out.extend_from_slice(p));
+        out
+    }
+
+    const RCL: [u8; 2] = [0x94, 0x20];
+    const EDM: [u8; 2] = [0x94, 0x2c];
+    const EOC: [u8; 2] = [0x94, 0x2f];
+
+    /// Apple's cue-level pop-on caption: load, `text` pairs of characters, then erase and flip
+    /// (the flip is pair `text + 4`).
+    fn caption(text: usize) -> Vec<u8> {
+        let mut pairs = vec![RCL, RCL];
+        pairs.extend(std::iter::repeat_n([0x48, 0x45], text));
+        pairs.extend([EDM, EDM, EOC, EOC]);
+        cdat(&pairs)
+    }
+
+    /// stts of the caption track (id 2) after defragmenting a source whose caption samples are
+    /// `(duration, data)`; the media track (id 1) shares the fragment.
+    fn caption_stts(samples: Vec<(u32, Vec<u8>)>) -> Vec<(u32, u32)> {
+        let tracks = [
+            TrackSpec { id: 1, timescale: 1000, entry: entry(b"mp4a") },
+            TrackSpec { id: 2, timescale: 1000, entry: entry(b"c608") },
+        ];
+        let mut src = init(&tracks);
+        let media = vec![(1000, 0, sample_data(1, 0))];
+        let cc = samples.into_iter().map(|(d, data)| (d, 0, data)).collect();
+        src.extend(fragment(1, &[Run { track: 1, start_time: 0, samples: media }, Run { track: 2, start_time: 0, samples: cc }], &|_| Vec::new()));
+        let mut out = Vec::new();
+        defragment(&src[..], &mut out, &Options::mv()).unwrap();
+        stts(bmff::parse(&out).unwrap()[1].all(b"trak").nth(1).unwrap())
+    }
+
+    /// A caption stamped when its first pair goes out appears when its end-of-caption pair does:
+    /// samples with one move to where it falls (29.97 pairs a second) and the track keeps its length.
+    #[test]
+    fn caption_samples_are_stamped_when_the_caption_appears() {
+        let null = cdat(&[[0x80, 0x80], [0x80, 0x80]]);
+        let erase = cdat(&[EDM, EDM]);
+        // The long caption has its flip at pair 28 (934 ticks), the short one at pair 10 (334 ticks).
+        let stts = caption_stts(vec![(1000, null), (3000, caption(24)), (1000, erase), (2000, caption(6))]);
+        // Stamps 0, 1000 + 934, 4000 (an erase moves nothing), 5000 + 334; the total stays 7000.
+        assert_eq!(stts, [(1, 1934), (1, 2066), (1, 1334), (1, 1666)]);
+    }
+
+    /// Frame-rate samples (one pair, the flip first) and tracks without any flip keep their timing.
+    #[test]
+    fn single_pair_caption_samples_are_not_moved() {
+        let stts = caption_stts(vec![(33, cdat(&[EOC])), (33, cdat(&[EOC])), (34, cdat(&[[0x80, 0x80]]))]);
+        assert_eq!(stts, [(2, 33), (1, 34)]);
+    }
+
+    /// Samples never overlap, even when a short sample is followed by a caption that flips later than it ends.
+    #[test]
+    fn retimed_caption_samples_stay_in_order() {
+        let stts = caption_stts(vec![(100, cdat(&[[0x80, 0x80]])), (100, caption(24)), (100, cdat(&[EDM, EDM]))]);
+        // Stamps 0, 100 + 934, then at least one tick after that; the last sample keeps one tick.
+        assert_eq!(stts, [(1, 1034), (2, 1)]);
     }
 
     /// The reference song layout: tag-compatible ftyp, one chunk per source

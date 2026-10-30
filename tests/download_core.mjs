@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildZip, zipParts, crc32, crc32Blob } from '../src/ui/zip.mjs';
-import { buildIlst } from '../src/ui/mp4-tags.mjs';
+import { buildIlst, discLayout } from '../src/ui/mp4-tags.mjs';
 import { formatPath, formatName, sanitize, fitFolder, fitFile } from '../src/ui/naming.mjs';
 import { pickMvVideo, pickMvAudio, mvQualityVars } from '../src/ui/mv-hls.mjs';
 // prefs.mjs 在加载时监听 storage 事件（其他标签页修改设置）；Node 中没有全局的 addEventListener
@@ -138,6 +138,35 @@ test('ilst items use iTunes atoms and data types', () => {
   assert.equal(Buffer.from(map.get('sonm')[0]).toString(), '晴天');
   assert.ok(!map.has('soar'));
   assert.deepEqual([...map.get('stik')[0]], [1]);
+});
+
+
+test('ilst: IDs beyond 32 bits are written as 8 bytes, sfID from the country code', () => {
+  const ilst = buildIlst({ title: 'Patient Zero', songId: '6814997425', albumId: '6814997249', artistId: '159260351', storefront: 'CA' });
+  const map = new Map(items(ilst).map(([k, ...v]) => [k, v]));
+  const big = (b) => [...b].reduce((n, x) => (n << 8n) | BigInt(x), 0n);
+  assert.equal(map.get('cnID')[0].length, 8);
+  assert.equal(big(map.get('cnID')[0]), 6814997425n);
+  assert.equal(map.get('atID')[0].length, 4); // 放得进 32 位的仍按 iTunes 写 4 字节
+  assert.equal(map.get('sfID')[0].length, 4);
+  assert.equal(big(map.get('sfID')[0]), 143455n);
+  // 表里没有的地区、没有地区：不写 sfID
+  assert.ok(!new Map(items(buildIlst({ title: 'x', storefront: 'zz' })).map(([k]) => [k])).has('sfID'));
+  assert.ok(!new Map(items(buildIlst({ title: 'x' })).map(([k]) => [k])).has('sfID'));
+});
+
+test('discLayout: track total is per disc, disc total is the number of discs, videos are not counted', () => {
+  const song = (disc) => ({ type: 'songs', attributes: disc === undefined ? {} : { discNumber: disc } });
+  // 与 The Life of a Showgirl 一致：第 1 碟 12 首，第 2 碟 4 首
+  const tracks = [...Array(12).fill(1), ...Array(4).fill(2)].map(song);
+  tracks.push({ type: 'music-videos', attributes: { discNumber: 2 } });
+  const { perDisc, discCount } = discLayout(tracks);
+  assert.equal(perDisc.get(1), 12);
+  assert.equal(perDisc.get(2), 4);
+  assert.equal(discCount, 2);
+  // 没有碟号的算第 1 碟；没有曲目时碟数为 1
+  assert.equal(discLayout([song(), song()]).perDisc.get(1), 2);
+  assert.equal(discLayout([]).discCount, 1);
 });
 
 test('music video ilst: stik 6 and the reference PERFORMER / RELEASETIME fields', () => {

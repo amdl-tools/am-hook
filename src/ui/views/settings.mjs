@@ -357,6 +357,7 @@ export function mount({ root, signal, onLangChange, toast }) {
       row(t('set.singleFile'), t('set.singleFileDesc'), template('singleFile', t('set.singleFile'), 'file', 'albumFolder'), { wide: true }));
 
     // 标签：嵌入字段
+    const checkEls = {};
     const checks = TAG_FIELDS.map((field) => {
       const input = el('input', { type: 'checkbox' });
       input.addEventListener('change', () => {
@@ -365,7 +366,18 @@ export function mount({ root, signal, onLangChange, toast }) {
         set({ embed: [...embed] });
       });
       controls.push((v) => { input.checked = v.embed.includes(field); });
-      return el('label', { className: 'set-check' }, input, el('span', { textContent: t(`set.field.${field}`) }));
+      const label = el('label', { className: 'set-check' }, input, el('span', { textContent: t(`set.field.${field}`) }));
+      checkEls[field] = { input, label };
+      return label;
+    });
+    // disktotal 仅在 disk 开启时有意义：disk 关闭时将其变暗并禁用
+    controls.push((v) => {
+      const diskOn = v.embed.includes('disk');
+      const c = checkEls.disktotal;
+      if (!c) return;
+      c.input.disabled = !diskOn;
+      c.label.style.opacity = diskOn ? '' : '0.4';
+      c.label.style.cursor = diskOn ? '' : 'default';
     });
     const all = el('button', { type: 'button', className: 'set-mini', textContent: t('set.all') });
     all.addEventListener('click', () => set({ embed: [...TAG_FIELDS] }));

@@ -27,16 +27,32 @@ function fragment(samples, { base = 0, field = 'cdat', cts = null, defaultSize =
   const { captionTracks, captionPackets, CaptionDecoder, BrowserCaptions } = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
   const tracks = captionTracks(init);
   assert.deepEqual(tracks, [{ id: 2, timescale: 1000, duration: 1000, size: 0 }]);
+  // A sample is stamped when its first byte pair goes out; its caption appears with the end-of-caption
+  // pair (the fifth here), one pair slot (1001/30000 s) per pair later. An erase has no such pair.
+  const flip = 4 * 1001 / 30000, near = (a, b) => assert(Math.abs(a - b) < 1e-9, `${a} != ${b}`);
   const packets = captionPackets(fragment([hello, erase]), tracks);
-  assert.deepEqual(packets.map(p => p.time), [0, 1]);
+  near(packets[0].time, flip); assert.equal(packets[1].time, 1);
   assert.deepEqual(Array.from(packets[0].bytes), hello);
   const cues = [], decoder = new CaptionDecoder(c => cues.push(c));
   decoder.add(packets);
-  assert.equal(cues[0].text, 'HELLO'); assert.equal(cues[0].start, 0); assert.equal(cues[0].end, 1);
+  assert.equal(cues[0].text, 'HELLO'); near(cues[0].start, flip); assert.equal(cues[0].end, 1);
   decoder.reset(); cues.length = 0;
   decoder.add(captionPackets(fragment([hello], { field: 'cdt2', base: 1000, cts: -100, defaultSize: true }), tracks));
   decoder.split(2);
-  assert.equal(cues[0].channel, 3); assert.equal(cues[0].start, 0.9); assert.equal(cues[0].end, 2);
+  assert.equal(cues[0].channel, 3); near(cues[0].start, 0.9 + flip); assert.equal(cues[0].end, 2);
+
+  // Long caption: 26 pairs of text between the load and the flip, so it appears about 0.9 s after its stamp.
+  const long = [0x14, 0x20, ...Array(26).fill([0x48, 0x45]).flat(), 0x14, 0x2f];
+  near(captionPackets(fragment([long]), tracks)[0].time, 27 * 1001 / 30000);
+  // Without the command (erase, null padding) the stamp is kept.
+  assert.deepEqual(captionPackets(fragment([erase, [0x80, 0x80]]), tracks).map(p => p.time), [0, 1]);
+  // A caption stamped just before a segment boundary but flipping after it keeps its flip time:
+  // closing the segment must not pull it back to the boundary.
+  decoder.reset(); cues.length = 0;
+  decoder.add(captionPackets(fragment([hello], { base: 1950 }), tracks));
+  decoder.split(2);
+  decoder.add(captionPackets(fragment([erase], { base: 3000 }), tracks));
+  assert.equal(cues.length, 1); near(cues[0].start, 1.95 + flip); assert.equal(cues[0].end, 3);
   assert.throws(() => captionPackets(fragment([hello]).subarray(0, -1), tracks), /size/);
   assert.throws(() => captionPackets(fragment([[0x14]]), tracks), /pair/);
   assert.deepEqual(captionPackets(new Uint8Array(), []), []);
@@ -63,5 +79,5 @@ function fragment(samples, { base = 0, field = 'cdat', cts = null, defaultSize =
   captions.append(fragment([[0, 0]], { base: 10000 }), 10, 10, 11);
   assert(nodes[0].track.cues.every(c => c.startTime < 10), 'a seek cannot carry old text into a gap');
   captions.destroy(); assert.equal(nodes.length, 0, 'stop/switch removes subtitle tracks');
-  console.log('MV captions: c608 extraction, CEA-608 decoding, timestamp/field handling, seek state, toggle and cleanup passed.');
+  console.log('MV captions: c608 extraction, CEA-608 decoding, flip-time stamping, timestamp/field handling, seek state, toggle and cleanup passed.');
 })().catch(e => { console.error(e); process.exitCode = 1; });

@@ -58,9 +58,45 @@ const present = (v) => v !== undefined && v !== null && v !== '' && !(typeof v =
 const numericId = (v) => (present(v) && /^\d{1,19}$/.test(String(v)) ? String(v) : null);
 
 /**
+ * iTunes Store 的 storefront ID（sfID 原子，MediaInfo 显示为 AppleStoreCountry），按两位国家 / 地区代码。
+ * 只收 amp-api /v1/storefronts 里有的地区；表中没有的地区不写 sfID。
+ */
+const STOREFRONT_IDS = {
+  ae: 143481, ag: 143540, ai: 143538, am: 143524, ao: 143564, ar: 143505, at: 143445, au: 143460, az: 143568,
+  bb: 143541, be: 143446, bg: 143526, bh: 143559, bj: 143576, bm: 143542, bo: 143556, br: 143503,
+  bs: 143539, bt: 143577, bw: 143525, by: 143565, bz: 143555, ca: 143455, cg: 143582, ch: 143459, cl: 143483, cn: 143465,
+  co: 143501, cr: 143495, cv: 143580, cy: 143557, cz: 143489, de: 143443, dk: 143458, dm: 143545, do: 143508, dz: 143563,
+  ec: 143509, ee: 143518, eg: 143516, es: 143454, fi: 143447, fj: 143583, fm: 143591, fr: 143442, gb: 143444, gd: 143546,
+  gh: 143573, gm: 143584, gr: 143448, gt: 143504, gw: 143585, gy: 143553, hk: 143463, hn: 143510, hr: 143494, hu: 143482,
+  id: 143476, ie: 143449, il: 143491, in: 143467, is: 143558, it: 143450, jm: 143511, jo: 143528, jp: 143462, ke: 143529,
+  kg: 143586, kh: 143579, kn: 143548, kr: 143466, kw: 143493, ky: 143544, kz: 143517, la: 143587, lb: 143497, lc: 143549,
+  lk: 143486, lr: 143588, lt: 143520, lu: 143451, lv: 143519, md: 143523, mg: 143531, mk: 143530, ml: 143532, mn: 143592,
+  mo: 143515, mr: 143590, ms: 143547, mt: 143521, mu: 143533, mw: 143589, mx: 143468, my: 143473, mz: 143593, na: 143594,
+  ne: 143534, ng: 143561, ni: 143512, nl: 143452, no: 143457, np: 143484, nz: 143461, om: 143562, pa: 143485, pe: 143507,
+  pg: 143597, ph: 143474, pl: 143478, pt: 143453, py: 143513, qa: 143498, ro: 143487, ru: 143469,
+  sa: 143479, sb: 143601, sc: 143599, se: 143456, sg: 143464, si: 143499, sk: 143496, sl: 143600, sn: 143535, sr: 143554,
+  sv: 143506, sz: 143602, tc: 143552, td: 143581, th: 143475, tj: 143603, tm: 143604, tn: 143536, tr: 143480,
+  tt: 143551, tw: 143470, tz: 143572, ua: 143492, ug: 143537, us: 143441, uy: 143514, uz: 143566, vc: 143550, ve: 143502,
+  vg: 143543, vn: 143471, ye: 143571, za: 143472, zw: 143605,
+};
+
+/** 由专辑的曲目列表得出每张碟的歌曲数与碟数（MV 不计）：trkn / disk 的 total 以此为准 */
+export function discLayout(tracks) {
+  const perDisc = new Map();
+  let discCount = 1;
+  for (const r of tracks || []) {
+    if (r.type === 'music-videos') continue;
+    const disc = (r.attributes && r.attributes.discNumber) || 1;
+    perDisc.set(disc, (perDisc.get(disc) || 0) + 1);
+    if (disc > discCount) discCount = disc;
+  }
+  return { perDisc, discCount };
+}
+
+/**
  * tags：{ title, artist, album, albumArtist, composer, genre, date, track: [n, total], disc: [n, total], lyrics,
  *   cover: { bytes, type }, copyright, label, upc, isrc, rating（0 无 / 1 explicit / 2 clean）, songId, albumId, artistId,
- *   compilation, sort: { title, artist, album, albumArtist, composer }, mediaType（stik：1 音乐，6 音乐视频，缺省为 1）,
+ *   compilation, storefront（两位地区代码，写 sfID）, sort: { title, artist, album, albumArtist, composer }, mediaType（stik：1 音乐，6 音乐视频，缺省为 1）,
  *   custom: { 名称: 值 }（其他 com.apple.iTunes 自定义字段，如 MV 的 PERFORMER、RELEASETIME） }
  */
 export function buildIlst(tags) {
@@ -91,7 +127,6 @@ export function buildIlst(tags) {
   add(present(tags.rating), () => item('rtng', TYPE_INT, intBytes(tags.rating, 1)));
   add(present(tags.copyright), () => text('cprt', tags.copyright));
   if (present(tags.label)) {
-    items.push(text('\xa9pub', tags.label));
     items.push(freeform('LABEL', tags.label));
   }
   add(present(tags.isrc), () => freeform('ISRC', tags.isrc));
@@ -100,10 +135,13 @@ export function buildIlst(tags) {
   const songId = numericId(tags.songId);
   const albumId = numericId(tags.albumId);
   const artistId = numericId(tags.artistId);
-  // cnID / atID 为 32 位，plID 为 64 位（与 iTunes 相同）；超出 32 位的 ID 不写
-  add(songId && Number(songId) <= 0xffffffff, () => item('cnID', TYPE_INT, intBytes(Number(songId), 4)));
+  // plID 固定 64 位；cnID / atID 在 32 位放得下时按 iTunes 的 4 字节写，放不下（如 2026 年起的歌曲 ID）改写 8 字节，与其他标签工具一致
+  const idBytes = (id) => (Number(id) <= 0xffffffff ? intBytes(Number(id), 4) : intBytes(id, 8));
+  add(songId, () => item('cnID', TYPE_INT, idBytes(songId)));
   add(albumId, () => item('plID', TYPE_INT, intBytes(albumId, 8)));
-  add(artistId && Number(artistId) <= 0xffffffff, () => item('atID', TYPE_INT, intBytes(Number(artistId), 4)));
+  add(artistId, () => item('atID', TYPE_INT, idBytes(artistId)));
+  const sfId = tags.storefront ? STOREFRONT_IDS[String(tags.storefront).toLowerCase()] : null;
+  add(sfId, () => item('sfID', TYPE_INT, intBytes(sfId, 4)));
   const sort = tags.sort || {};
   add(present(sort.title), () => text('sonm', sort.title));
   add(present(sort.artist), () => text('soar', sort.artist));
