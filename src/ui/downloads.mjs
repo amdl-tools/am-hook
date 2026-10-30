@@ -19,7 +19,7 @@
 //   downloads.folder             保存到文件夹：{ supported, name(), pick() }
 
 import { prefs, classify, pickVariant } from './prefs.mjs';
-import { buildIlst, imageType } from './mp4-tags.mjs';
+import { buildIlst, discLayout, imageType } from './mp4-tags.mjs';
 import { buildZip, crc32 } from './zip.mjs';
 import { formatPath, formatName, fitFolder, fitFile } from './naming.mjs';
 import { ttmlToLrc } from './lrc.mjs';
@@ -343,8 +343,6 @@ async function prepare(job, spec) {
       artwork: ((ca.editorialArtwork && ca.editorialArtwork.staticDetailSquare) || ca.artwork || {}).url || '',
       // 专辑本身：MV 的 amp-api 资源不一定带所属专辑，这时用它的 UPC、版权与厂牌
       attributes: job.kind === 'album' ? ca : null,
-      // 专辑的碟数：所有曲目（不只是选中的）中最大的碟号
-      discCount: job.kind === 'album' ? Math.max(1, ...list.map((r) => (r.attributes && r.attributes.discNumber) || 1)) : 0,
       total: list.filter(playable).length,
     };
 
@@ -379,6 +377,33 @@ async function prepare(job, spec) {
         error: '',
       };
     });
+    // 每张碟的曲目数与碟数：trkn / disk 的 total 都是相对于所属专辑而言，必须用专辑的完整曲目列表来数，
+    // 不能用被选中的任务（单曲下载时只有 1 首）。专辑任务直接用 list；单曲 / 歌单则按所属专辑各取一次
+    job.collection.layout = job.kind === 'album' ? discLayout(list) : null;
+    job.collection.albumLayouts = new Map();
+    // 曲目号 / 碟号都没写入，或歌单曲目用歌单序号时，用不到专辑的曲目列表，不必再请求
+    const embed = job.options.embed;
+    const needLayout = (embed.includes('tracknum') || embed.includes('disk')) && !(job.kind === 'playlist' && !job.options.playlistAlbumInfo);
+    if (job.kind !== 'album' && needLayout) {
+      const albumIds = new Set();
+      for (const task of job.tasks) {
+        const al = albumOf(task.song);
+        if (al && al.id) albumIds.add(al.id);
+      }
+      await Promise.all([...albumIds].map(async (id) => {
+        try {
+          const data = await amp(`/v1/catalog/${cc}/albums/${id}`, { l, include: 'tracks' });
+          const al = data.data && data.data[0];
+          const rel = al && al.relationships && al.relationships.tracks;
+          const tracks = await allPages(rel && rel.data, rel && rel.next, { l });
+          job.collection.albumLayouts.set(id, discLayout(tracks));
+        } catch (err) {
+          if (job.ctl.signal.aborted) throw err;
+          // 取不到专辑曲目列表时退回专辑属性里的 trackCount
+        }
+      }));
+      job.ctl.signal.throwIfAborted();
+    }
     const first = job.tasks[0].song;
     const fa = first.attributes || {};
     if (single(job)) {
@@ -415,7 +440,8 @@ function trackInfo(job, task) {
   const aa = (album && album.attributes) || (job.kind === 'album' && job.collection.attributes) || {};
   const artist = task.song.relationships && task.song.relationships.artists && task.song.relationships.artists.data && task.song.relationships.artists.data[0];
   const playlistTags = job.kind === 'playlist' && !job.options.playlistAlbumInfo;
-  const discCount = job.kind === 'album' ? job.collection.discCount : 0;
+  const layout = job.kind === 'album' ? job.collection.layout : (album && job.collection.albumLayouts && job.collection.albumLayouts.get(album.id)) || null;
+  const discCount = layout ? layout.discCount : 0;
   return {
     mv: !!task.mv,
     title: a.name || '',
@@ -425,7 +451,7 @@ function trackInfo(job, task) {
     composer: a.composerName || '',
     genre: (a.genreNames || [])[0] || '',
     date: a.releaseDate || aa.releaseDate || '',
-    track: playlistTags ? [task.index, job.collection.total] : [a.trackNumber || 0, aa.trackCount || 0],
+    track: playlistTags ? [task.index, job.collection.total] : [a.trackNumber || 0, (layout && layout.perDisc.get(a.discNumber || 1)) || aa.trackCount || 0],
     disc: playlistTags ? [1, 1] : [a.discNumber || 0, discCount],
     copyright: aa.copyright || '',
     label: aa.recordLabel || '',
@@ -435,6 +461,7 @@ function trackInfo(job, task) {
     songId: task.id,
     albumId: album ? album.id : (job.kind === 'album' ? job.cid : ''),
     artistId: artist ? artist.id : '',
+    storefront: (AmI18n.regions[0] || job.country || '').toLowerCase(),
     compilation: !!aa.isCompilation,
     artwork: (a.artwork && a.artwork.url) || aa.artwork && aa.artwork.url || job.collection.artwork,
   };
@@ -654,7 +681,7 @@ function checkWhileDownloading(task, track, v, o) {
  */
 async function downloadVideo(job, task, info, signal) {
   const o = job.options;
-  if (!AmDecrypt.opfsSupported()) throw Object.assign(new Error(t('set.mvNoOpfs')), { final: true });
+  // OPFS 不可用时，mv-engine.mjs 的 downloadStreamsMemory 会在内存中处理
   const { masterUrl, masterBody } = await AmWrapper.mvMaster(task.id, signal);
   const master = parseMaster(masterBody, masterUrl);
   const video = pickMvVideo(master.videos, o.mvMax);
@@ -743,7 +770,7 @@ function tagsFor(info, embed, o, cover, lyrics, custom = null) {
     genre: on('genre') ? info.genre : '',
     date: on('created') ? info.date : '',
     track: on('tracknum') ? info.track : null,
-    disc: on('disk') ? info.disc : null,
+    disc: on('disk') ? [info.disc[0], on('disktotal') ? info.disc[1] : 0] : null,
     lyrics: on('lyrics') && lyrics ? lyrics.lrc : '',
     cover: on('cover') ? cover : null,
     copyright: on('copyright') ? info.copyright : '',
@@ -754,6 +781,7 @@ function tagsFor(info, embed, o, cover, lyrics, custom = null) {
     songId: on('song_id') ? info.songId : '',
     albumId: on('album_id') ? info.albumId : '',
     artistId: on('artist_id') ? info.artistId : '',
+    storefront: on('storefront') ? info.storefront : '',
     compilation: on('album') && info.compilation,
     sort: o.sortTags ? { title: info.title, artist: info.artist, album: info.album, albumArtist: info.albumArtist, composer: info.composer } : null,
     // MV：媒体类型为音乐视频；另写参考实现的 PERFORMER 与 RELEASETIME
@@ -762,10 +790,13 @@ function tagsFor(info, embed, o, cover, lyrics, custom = null) {
   };
 }
 
+/** MV 资源链接里的地区（music.apple.com/{cc}/...）；链接里没有就返回空，不用设置里的主地区去猜 */
+const mvCountry = (resource) => (((resource.attributes && resource.attributes.url) || '').match(/^https?:\/\/music\.apple\.com\/([a-z]{2})\//i) || [])[1]?.toLowerCase() || '';
+
 /** MV 页自己下载时的标签，与这里单独下载 MV 的相同：resource 为 music-videos 资源（含 albums、artists 关系） */
 export async function mvTags(resource, signal) {
   const options = prefs.get('download');
-  const job = { kind: 'music-video', cid: resource.id, options, covers: new Map(), collection: { name: '', artist: '', artwork: '', attributes: null, discCount: 0, total: 1 } };
+  const job = { kind: 'music-video', cid: resource.id, country: mvCountry(resource), options, covers: new Map(), collection: { name: '', artist: '', artwork: '', attributes: null, total: 1 } };
   const info = trackInfo(job, { id: resource.id, mv: true, index: 1, song: resource });
   const embed = new Set(options.embed);
   const cover = await coverFor(job, info, signal, embed.has('cover'));

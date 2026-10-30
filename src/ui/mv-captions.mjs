@@ -48,6 +48,19 @@ export function captionTracks(init) {
   return tracks;
 }
 
+// CEA-608 sends one byte pair per frame slot, 30000/1001 pairs a second. Apple stamps a whole
+// caption sample when its first pair goes out, but a pop-on caption only appears with its
+// end-of-caption command at the end of the pairs, a second or more later. The parser gives all
+// pairs of a packet one time, so a packet is stamped with the time that command is sent.
+const PAIR_SECONDS = 1001 / 30000;
+function flipDelay(pairs) {
+  for (let i = 0; i + 1 < pairs.length; i += 2) {
+    const a = pairs[i] & 0x7f;
+    if ((a === 0x14 || a === 0x15 || a === 0x1c || a === 0x1d) && (pairs[i + 1] & 0x7f) === 0x2f) return i / 2 * PAIR_SECONDS;
+  }
+  return 0;
+}
+
 export function captionPackets(bytes, tracks) {
   if (!tracks.length) return [];
   const r = reader(bytes), packets = [], top = r.boxes();
@@ -85,8 +98,9 @@ export function captionPackets(bytes, tracks) {
           for (const box of r.boxes(offset, offset + sampleSize)) {
             if (box.type !== 'cdat' && box.type !== 'cdt2') continue;
             if ((box.end - box.data) % 2) throw new Error('Incomplete CEA-608 byte pair');
+            const pairs = bytes.slice(box.data, box.end);
             packets.push({ track: track.id, field: box.type === 'cdat' ? 1 : 3,
-              time: (dts + cts) / track.timescale, bytes: bytes.slice(box.data, box.end) });
+              time: (dts + cts) / track.timescale + flipDelay(pairs), bytes: pairs });
           }
           offset += sampleSize; dts += sampleDuration;
         }
@@ -97,7 +111,7 @@ export function captionPackets(bytes, tracks) {
 }
 
 export class CaptionDecoder {
-  constructor(emit) { this.emit = emit; this.parsers = new Map(); }
+  constructor(emit) { this.emit = emit; this.parsers = new Map(); this.times = new Map(); }
   parser(id, field) {
     const key = `${id}:${field}`;
     if (!this.parsers.has(key)) {
@@ -112,9 +126,19 @@ export class CaptionDecoder {
     }
     return this.parsers.get(key);
   }
-  add(packets) { for (const p of packets) this.parser(p.track, p.field).addData(p.time, p.bytes); }
-  split(time) { for (const parser of this.parsers.values()) parser.cueSplitAtTime(time); }
-  reset() { this.parsers.clear(); }
+  add(packets) {
+    for (const p of packets) {
+      this.parser(p.track, p.field).addData(p.time, p.bytes);
+      const key = `${p.track}:${p.field}`;
+      this.times.set(key, Math.max(this.times.get(key) ?? -Infinity, p.time));
+    }
+  }
+  // A caption that appears after `time` (its flip is stamped in this segment but lands in the next)
+  // must not be pulled back to the boundary.
+  split(time) {
+    for (const [key, parser] of this.parsers) if (!(this.times.get(key) > time)) parser.cueSplitAtTime(time);
+  }
+  reset() { this.parsers.clear(); this.times.clear(); }
 }
 
 export class BrowserCaptions {

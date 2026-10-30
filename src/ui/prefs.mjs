@@ -12,8 +12,8 @@ const STORAGE_KEY = 'am-hook:settings';
 
 /** iTunes 标签中可选写入的字段（与 amd.wol.moe 的「嵌入标签字段」相同） */
 export const TAG_FIELDS = [
-  'title', 'artist', 'album', 'album_artist', 'composer', 'genre', 'created', 'tracknum', 'disk',
-  'lyrics', 'cover', 'copyright', 'record_company', 'upc', 'isrc', 'rtng', 'song_id', 'album_id', 'artist_id',
+  'title', 'artist', 'album', 'album_artist', 'composer', 'genre', 'created', 'tracknum', 'disk', 'disktotal',
+  'lyrics', 'cover', 'copyright', 'record_company', 'upc', 'isrc', 'rtng', 'song_id', 'album_id', 'artist_id', 'storefront',
 ];
 
 /** 首选音质按下拉框的分组排列（set.codecGroup.*）；取值见下面的 pickVariant */
