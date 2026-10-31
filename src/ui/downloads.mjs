@@ -461,7 +461,7 @@ function trackInfo(job, task) {
     songId: task.id,
     albumId: album ? album.id : (job.kind === 'album' ? job.cid : ''),
     artistId: artist ? artist.id : '',
-    storefront: (AmI18n.regions[0] || job.country || '').toLowerCase(),
+    storefront: (AmI18n.regions.includes(job.country) ? job.country : (AmI18n.regions[0] || job.country || '')).toLowerCase(),
     compilation: !!aa.isCompilation,
     artwork: (a.artwork && a.artwork.url) || aa.artwork && aa.artwork.url || job.collection.artwork,
   };

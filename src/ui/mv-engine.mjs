@@ -223,6 +223,31 @@ export async function collectGarbage() {
 }
 // Segment requests kept in flight while earlier segments are decrypted and written in order.
 const PREFETCH = 4;
+// Shared fetch-ahead + decrypt loop used by both the OPFS and in-memory paths.
+// Calls onFragment(data, i, queue.length, bytes) for every decrypted fragment in order.
+async function forEachFragment(streams, core, signal, onFragment) {
+  const mux = streams.length > 1;
+  const queue = streams.flatMap(s => s.segments.map(segment => ({ stream: s, segment })));
+  const pending = new Map();
+  let ahead = 0, sequence = 1, bytes = 0;
+  const fetchNext = () => {
+    const { stream, segment } = queue[ahead];
+    const raw = segment === stream.segments[0] ? Promise.resolve(stream.firstRaw) : fetchResource(segment, signal);
+    raw.catch(() => {}); // awaited below; an abort must not surface as an unhandled rejection
+    pending.set(ahead++, raw);
+  };
+  for (let i = 0; i < queue.length; i++) {
+    while (ahead < queue.length && ahead < i + PREFETCH) fetchNext();
+    const raw = await pending.get(i); pending.delete(i);
+    signal.throwIfAborted();
+    const { stream, segment } = queue[i];
+    const data = await core.call('fragment', stream.name, raw, stream.keys.get(segment.key) || new Uint8Array(16), mux, sequence);
+    if (mux) sequence += moofCount(data);
+    bytes += data.length;
+    await onFragment(data, i, queue.length, bytes);
+  }
+}
+
 // tags: optional async () => Uint8Array of ilst items (mp4-tags.mjs), awaited before defragmenting;
 // crc: also compute the output's CRC-32 (for ZIP packaging). Returns { file, crc, dispose }.
 export async function downloadMV(id, video, audio, { signal, onProgress, onDefrag, tags, crc = false }) {
@@ -236,7 +261,7 @@ export async function downloadMV(id, video, audio, { signal, onProgress, onDefra
 // init, firstRaw, duration }, see prepare above): video then audio are muxed into one file, a single stream (an
 // audio-only episode) keeps its own init. bandwidth (bits/s) only estimates the OPFS space needed.
 export async function downloadStreams({ prepare: prepareStreams, bandwidth, signal, onProgress, onDefrag, tags, crc = false }) {
-  if (!navigator.storage?.getDirectory) return downloadStreamsMemory({ prepareStreams, signal, onProgress, onDefrag, tags, crc });
+  if (!navigator.storage?.getDirectory) return downloadStreamsMemory({ prepareStreams, bandwidth, signal, onProgress, onDefrag, tags, crc });
   await collectGarbage();
   const root = await navigator.storage.getDirectory();
   const uuid = crypto.randomUUID(), fragmented = `${PREFIX}${uuid}.fmp4`, name = `${PREFIX}${uuid}.mp4`;
@@ -260,26 +285,12 @@ export async function downloadStreams({ prepare: prepareStreams, bandwidth, sign
     await writer.write(init);
     // The whole video track, then the whole audio track (as the reference writes them): defrag keeps
     // tracks one after another, so it then reads the fragmented file front to back.
-    const queue = streams.flatMap(s => s.segments.map(segment => ({ stream: s, segment })));
-    const pending = new Map();
-    let ahead = 0;
-    const fetchNext = () => {
-      const { stream, segment } = queue[ahead];
-      const raw = segment === stream.segments[0] ? Promise.resolve(stream.firstRaw) : fetchResource(segment, signal);
-      raw.catch(() => {}); // awaited below; an abort must not surface as an unhandled rejection
-      pending.set(ahead++, raw);
-    };
-    let sequence = 1, bytes = init.length;
-    for (let i = 0; i < queue.length; i++) {
-      while (ahead < queue.length && ahead < i + PREFETCH) fetchNext();
-      const raw = await pending.get(i); pending.delete(i);
-      signal.throwIfAborted();
-      const { stream, segment } = queue[i];
-      const data = await core.call('fragment', stream.name, raw, stream.keys.get(segment.key) || new Uint8Array(16), mux, sequence);
-      if (mux) sequence += moofCount(data);
-      await writer.write(data); bytes += data.length;
-      onProgress((i + 1) / queue.length, bytes);
-    }
+    let totalBytes = init.length;
+    await forEachFragment(streams, core, signal, async (data, i, total, fragBytes) => {
+      await writer.write(data);
+      totalBytes += data.length;
+      onProgress((i + 1) / total, totalBytes);
+    });
     signal.throwIfAborted(); await writer.close(); writer = null;
     const ilst = tags ? await tags() : null;
     signal.throwIfAborted();
@@ -299,7 +310,8 @@ export async function downloadStreams({ prepare: prepareStreams, bandwidth, sign
 }
 // In-memory fallback for downloadStreams when OPFS is unavailable (plain HTTP / non-secure context).
 // Accumulates all fragments as Blobs, then defragments via the worker's in-memory path.
-async function downloadStreamsMemory({ prepareStreams, signal, onProgress, onDefrag, tags, crc }) {
+// Fix 1: estimates RAM usage from bandwidth * duration and rejects > ~600 MB with a helpful message.
+async function downloadStreamsMemory({ prepareStreams, bandwidth, signal, onProgress, onDefrag, tags, crc }) {
   const core = new Core();
   const abort = () => core.close(); signal.addEventListener('abort', abort, { once: true });
   try {
@@ -307,27 +319,22 @@ async function downloadStreamsMemory({ prepareStreams, signal, onProgress, onDef
     const streams = await prepareStreams(core);
     const mux = streams.length > 1;
     const duration = Math.max(...streams.map(s => s.duration));
+    // Warn before accumulating: bandwidth (bits/s) / 8 gives bytes/s; ×2 for fragmented + defrag output.
+    if (bandwidth && duration) {
+      const estimatedMB = bandwidth / 8 * duration / 1024 / 1024;
+      if (estimatedMB > 300) {
+        core.close();
+        throw new Error(`This MV is approximately ${Math.round(estimatedMB)} MB and would be assembled entirely in RAM. Open via http://localhost or HTTPS to enable browser storage (OPFS) for large MV downloads.`);
+      }
+    }
     const init = mux ? await core.call('muxInit', streams[0].name, streams[1].name, duration) : streams[0].init.slice();
     const parts = [init];
-    const queue = streams.flatMap(s => s.segments.map(segment => ({ stream: s, segment })));
-    const pending = new Map();
-    let ahead = 0, sequence = 1, bytes = init.length;
-    const fetchNext = () => {
-      const { stream, segment } = queue[ahead];
-      const raw = segment === stream.segments[0] ? Promise.resolve(stream.firstRaw) : fetchResource(segment, signal);
-      raw.catch(() => {});
-      pending.set(ahead++, raw);
-    };
-    for (let i = 0; i < queue.length; i++) {
-      while (ahead < queue.length && ahead < i + PREFETCH) fetchNext();
-      const raw = await pending.get(i); pending.delete(i);
-      signal.throwIfAborted();
-      const { stream, segment } = queue[i];
-      const data = await core.call('fragment', stream.name, raw, stream.keys.get(segment.key) || new Uint8Array(16), mux, sequence);
-      if (mux) sequence += moofCount(data);
-      parts.push(data); bytes += data.length;
-      onProgress((i + 1) / queue.length, bytes);
-    }
+    let totalBytes = init.length;
+    await forEachFragment(streams, core, signal, async (data, i, total) => {
+      parts.push(data);
+      totalBytes += data.length;
+      onProgress((i + 1) / total, totalBytes);
+    });
     signal.throwIfAborted();
     const ilst = tags ? await tags() : null;
     signal.throwIfAborted();

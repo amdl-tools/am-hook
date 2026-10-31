@@ -88,27 +88,17 @@ async function defrag(song, input, output, dir, tags, crc = !!song) {
   } finally { source.close(); target?.close(); }
 }
 // Without OPFS (e.g. plain HTTP), the same code reads a Blob's bytes and returns a Blob.
-async function defragBlob(blob, tags) {
-  const bytes = new Uint8Array(await blob.arrayBuffer()), parts = [];
-  let length = 0;
-  const source = { getSize: () => bytes.length, read: (view, { at }) => { const part = bytes.subarray(at, at + view.length); view.set(part); return part.length; } };
-  const writer = crcWriter({ getSize: () => length, write: (view, { at }) => {
-    if (at !== length) return -1;
-    parts.push(view.slice()); length += view.length; return view.length;
-  } });
-  withFiles(source, writer, (i, o) => invoke('media_defrag', i, o, 1, tags || new Uint8Array(0)));
-  return { blob: new Blob(parts, { type: blob.type }), size: length, crc: writer.crc() };
-}
-// MV variant of defragBlob: uses song=0 (interleaved MV layout) and returns { blob, size, crc }.
-// Used as a fallback when OPFS is unavailable (plain HTTP / non-secure context).
-async function defragMVBlob(blob, tags, crc) {
+// song=1 produces the reference song layout (always CRC'd); song=0 produces the interleaved MV
+// layout and only CRC's when crc=true. Both paths are identical except for those two flags,
+// which is why they share one function.
+async function defragBlob(blob, tags, song = 1, crc = true) {
   const bytes = new Uint8Array(await blob.arrayBuffer()), parts = [];
   let length = 0;
   const source = { getSize: () => bytes.length, read: (view, { at }) => { const part = bytes.subarray(at, at + view.length); view.set(part); return part.length; } };
   const inner = { getSize: () => length, write: (view, { at }) => { if (at !== length) return -1; parts.push(view.slice()); length += view.length; return view.length; } };
   const writer = crc ? crcWriter(inner) : inner;
-  withFiles(source, writer, (i, o) => invoke('media_defrag', i, o, 0, tags || new Uint8Array(0)));
-  return { blob: new Blob(parts, { type: 'video/mp4' }), size: length, crc: crc ? writer.crc() : null };
+  withFiles(source, writer, (i, o) => invoke('media_defrag', i, o, song, tags || new Uint8Array(0)));
+  return { blob: new Blob(parts, { type: blob.type }), size: length, crc: crc ? writer.crc() : null };
 }
 
 const methods = {
@@ -123,10 +113,10 @@ const methods = {
   // defrag(input, output, tags?, crc?) -> { size, crc }: the MV layout; crc is null unless asked for.
   defrag: (input, output, tags, crc) => defrag(0, input, output, undefined, tags, !!crc),
   // defragMV(blob, tags?, crc?) -> { blob, size, crc }: in-memory fallback when OPFS is unavailable.
-  defragMV: (blob, tags, crc) => defragMVBlob(blob, tags, !!crc),
+  defragMV: (blob, tags, crc) => defragBlob(blob, tags, 0, !!crc),
   // defragSong(blob, tags) -> { blob, size, crc } or defragSong(input, output, dir, tags) -> { size, crc }:
   // the reference song layout; tags (Uint8Array, may be omitted) are the ilst items (see mp4-tags.mjs).
-  defragSong: (...args) => args[0] instanceof Blob ? defragBlob(args[0], args[1]) : defrag(1, ...args),
+  defragSong: (...args) => args[0] instanceof Blob ? defragBlob(args[0], args[1], 1, true) : defrag(1, ...args),
 };
 self.onmessage = async ({ data: { id, method, args } }) => {
   try {
