@@ -26,6 +26,36 @@
   /** 分段加载失败后自动重试的次数（间隔 3、6、12、24、48 秒），之后等用户点「立即重试」 */
   const MAX_RETRIES = 5;
 
+  /**
+   * 失败后的自动重试（MseEngine 与 PcmEngine 共用），状态记在引擎上：failures、retryAt、gaveUp、retryTimer。
+   * 间隔从 3 秒起按连续失败次数翻倍，加 ±20% 抖动，避免故障期间所有客户端同步打过去；
+   * 重试 MAX_RETRIES 次仍失败后停止（gaveUp），等用户点「立即重试」。等待期间引擎不应自行加载（retryAt / gaveUp）
+   */
+  function scheduleRetry(engine, run) {
+    clearTimeout(engine.retryTimer);
+    if (engine.failures >= MAX_RETRIES) {
+      engine.gaveUp = true;
+      return;
+    }
+    const delay = 3000 * 2 ** engine.failures * (0.8 + Math.random() * 0.4);
+    engine.failures++;
+    engine.retryAt = Date.now() + delay;
+    engine.retryTimer = setTimeout(() => {
+      engine.retryAt = null;
+      if (engine.onRetry) engine.onRetry();
+      run();
+    }, delay);
+  }
+
+  /** 成功、手动重试或换曲：清空重试状态 */
+  function resetRetry(engine) {
+    clearTimeout(engine.retryTimer);
+    engine.retryTimer = null;
+    engine.failures = 0;
+    engine.retryAt = null;
+    engine.gaveUp = false;
+  }
+
   /** time 所在 segment 下标 */
   function segmentAt(segments, time) {
     let lo = 0;
@@ -113,14 +143,64 @@
     return node;
   }
 
-  /* ---------- 播放队列的曲目：逐首解析 master，选浏览器能播放的最高音质 ---------- */
+  /**
+   * 播放音质的设置（设置中心「播放」，prefs.mjs 的 playbackFor）：{ quality: efficient / high / lossless / hires, spatial: auto / always / off }，
+   * quality 已按当前网络（Wi-Fi / 移动数据）取好。app.mjs 用 usePlaybackSettings 接上；没有接上时（如 Node 测试）为最高音质、自动
+   */
+  const PLAYBACK_DEFAULT = { quality: 'hires', spatial: 'auto' };
+  let playbackStore = null;
+  function usePlaybackSettings(store) { playbackStore = store; }
+  function playbackSettings() { return playbackStore ? playbackStore.get() : PLAYBACK_DEFAULT; }
+
+  /** 队列是否优先选杜比全景声：始终，或自动（开启 JOC 对象渲染时）；「高效」音质下不选（码率是 HE-AAC 的十倍以上） */
+  function preferAtmos(settings = playbackSettings()) {
+    if (settings.quality === 'efficient' || settings.spatial === 'off') return false;
+    return settings.spatial === 'always' || jocSettings().mode !== 'off';
+  }
+
+  /* ---------- 播放队列的曲目：逐首解析 master，按播放音质设置选浏览器能播放的变体 ---------- */
   function rankVariant(v) {
     const g = v.group_id.toLowerCase();
-    // 开启 JOC 对象渲染时全景声排在 ALAC 前面：队列播放选它，否则只有手动换音质时才用得上
-    const atmosFirst = jocSettings().mode !== 'off';
+    // 优先全景声时排在 ALAC 前面（音质详情的列表顺序与队列的最后退路）
+    const atmosFirst = preferAtmos();
     if (g.includes('alac')) return atmosFirst ? 1 : 0;
     if (g.includes('atmos')) return atmosFirst ? 0 : 1;
     return g.includes('he-') ? 3 : 2;
+  }
+
+  /** 变体的种类：alac / atmos / aac（AAC-LC 立体声）/ he（HE-AAC 立体声）/ other（双耳、缩混等） */
+  function variantKind(v) {
+    const g = v.group_id.toLowerCase();
+    if (g.includes('alac')) return 'alac';
+    if (g.includes('atmos') && !g.includes('downmix')) return 'atmos';
+    if (g.includes('binaural') || g.includes('downmix')) return 'other';
+    return g.includes('he-') ? 'he' : 'aac';
+  }
+
+  function sampleRate(v) {
+    return v.sample_rate || Number((v.group_id.match(/alac-stereo-(\d+)/i) || [])[1]) || 0;
+  }
+
+  /** 各播放音质依次尝试的种类（alac 带采样率上限）；都没有时退到 sortVariants 的顺序 */
+  const QUALITY_STEPS = {
+    hires: [['alac', 192000], ['aac'], ['he']],
+    lossless: [['alac', 48000], ['aac'], ['he']],
+    high: [['aac'], ['he'], ['alac', 48000]],
+    efficient: [['he'], ['aac'], ['alac', 48000]],
+  };
+
+  /** 按播放音质设置从 master 的变体中选浏览器能播放的一个；没有可播放的返回 undefined */
+  function pickPlayable(variants, settings = playbackSettings()) {
+    const playable = variants.filter((v) => detectMode(v.codecs));
+    const steps = [...(preferAtmos(settings) ? [['atmos']] : []), ...(QUALITY_STEPS[settings.quality] || QUALITY_STEPS.hires)];
+    for (const [kind, maxRate] of steps) {
+      const list = playable.filter((v) => variantKind(v) === kind && (!maxRate || sampleRate(v) <= maxRate));
+      if (!list.length) continue;
+      // 同类取最高：ALAC 按采样率与位深，其余按码率
+      const rank = (v) => (kind === 'alac' ? sampleRate(v) * 100 + (v.bit_depth || 0) : v.bandwidth || 0);
+      return list.reduce((best, v) => (rank(v) > rank(best) ? v : best));
+    }
+    return sortVariants(playable)[0];
   }
 
   function variantLabel(v) {
@@ -331,7 +411,7 @@
 
   async function resolveEntry(entry) {
     const { variants } = await global.AmWrapper.songMaster(entry.track);
-    const best = sortVariants(variants).find((v) => detectMode(v.codecs));
+    const best = pickPlayable(variants);
     if (!best) throw Object.assign(new Error(t('album.noPlayable', { name: entry.name })), { noPlayable: true });
     return {
       ...variantItem(entry.track, best),
@@ -549,10 +629,22 @@
       this.anchorContextTime = this.context.currentTime + 0.03;
       this.loadedUntil = 0;
       this.generation = 0;
+      /** 加载出错后等待恢复（与 MseEngine 相同，见 fail / recovered）；retryMode 为恢复方式：'pump' 接着加载，'seek' 从当前位置重新开始 */
+      this.failed = false;
+      this.failures = 0;
+      this.retryAt = null;
+      this.gaveUp = false;
+      /** 出错后缓冲播完而暂停：恢复后自动继续播放 */
+      this.stalled = false;
       this.timer = setInterval(() => {
         if (!this.paused && this.duration && this.currentTime >= this.duration) {
           this.pause();
           if (this.onEnded) this.onEnded();
+        }
+        // 出错后已排好的缓冲照常播放，播完才停下等待重试，免得时钟跑到音频前面
+        if (!this.paused && this.failed && !this.seeking && this.currentTime >= this.loadedUntil - 0.05) {
+          this.pause();
+          this.stalled = true;
         }
         if (!this.paused) this.pump();
         this.onUpdate();
@@ -583,16 +675,19 @@
     }
 
     async pump(first = false) {
-      if (this.busy || this.failed || !this.playlist || !this.decoder) return;
+      if (this.busy || this.waitingRetry || !this.playlist || !this.decoder) return;
       this.busy = true;
       const gen = this.generation;
       const required = first;
+      let decoding = false;
       try {
         const { segments } = this.playlist;
         while (this.nextIndex < segments.length && (first || segments[this.nextIndex].time < this.currentTime + 12)) {
           const seg = segments[this.nextIndex];
+          decoding = false;
           const encrypted = await this.playlist.load(seg, this.controller.signal);
           if (gen !== this.generation) return;
+          decoding = true;
           const decoded = await this.decoder.decode(encrypted);
           if (gen !== this.generation) return;
           const { channels, rate, samples, chunks } = decoded;
@@ -631,24 +726,88 @@
           this.loadedUntil = Math.max(this.loadedUntil, seg.time + samples / rate);
           this.nextIndex++;
           first = false;
+          this.recovered();
           this.onUpdate();
           if (required) break;
         }
       } catch (error) {
         if (required && gen === this.generation) throw error;
-        if (error.name !== 'AbortError' && gen === this.generation) {
-          this.failed = true;
-          this.pause();
-          this.onError(error);
-        }
+        if (error.name !== 'AbortError' && gen === this.generation) this.failLoading(error, decoding);
       } finally {
         this.busy = false;
       }
     }
 
+    /** 等待自动重试或已停止重试：不自行加载 */
+    get waitingRetry() { return Boolean(this.retryAt || this.gaveUp); }
+
+    /**
+     * 后台加载出错：取分段（含 key）出错时接着加载，已排好的缓冲继续播放；
+     * 解码出错时解码器状态不可靠，停下后从当前位置重新开始
+     */
+    failLoading(error, decoding) {
+      if (!decoding) { this.fail(error, 'pump'); return; }
+      const resume = !this.paused || this.stalled;
+      this.pause();
+      this.fail(error, 'seek', resume);
+    }
+
+    /**
+     * 加载出错：提示后按 MseEngine 的节奏自动重试（scheduleRetry）。mode 为恢复方式：
+     * 'pump'（后台加载分段出错）接着加载，已排好的缓冲继续播放；'seek'（Seek 或解码出错）从 anchorTime 重新开始，
+     * resume 为之后是否继续播放
+     */
+    fail(error, mode, resume = false) {
+      // 已在等待重新开始（如 Worker 报错的同时进行中的加载也失败）：不重复计数
+      if (this.waitingRetry && (this.retryMode === 'seek' || mode === 'pump')) return;
+      if (!this.failed && this.onError) this.onError(error);
+      this.failed = true;
+      this.retryMode = mode;
+      this.retryResume = resume;
+      scheduleRetry(this, () => this.retry());
+      if (this.onRetry) this.onRetry();
+    }
+
+    retry() {
+      if (this.retryMode !== 'seek') { this.pump(); return; }
+      const task = this.seek(this.anchorTime, this.retryResume);
+      if (task) task.catch(() => {});
+    }
+
+    /** 失败后立即重试，并重新计算自动重试次数 */
+    retryNow() {
+      if (!this.failed) return;
+      resetRetry(this);
+      if (this.onRetry) this.onRetry();
+      this.retry();
+    }
+
+    /** 出错后又加载成功：清除错误；因缓冲播完而暂停的继续播放 */
+    recovered() {
+      if (!this.failed) return;
+      this.failed = false;
+      resetRetry(this);
+      if (this.onRecover) this.onRecover();
+      if (this.stalled) this.play().catch(() => {});
+    }
+
     async play() {
       if (this.seeking) { this.resumeAfterSeek = true; return this.seekTask; }
-      this.failed = false;
+      // 出错后用户点播放：立即重试
+      if (this.failed) {
+        if (this.retryMode === 'seek') {
+          this.retryResume = true;
+          this.retryNow();
+          // 结果由 fail / recovered 处理
+          if (this.seekTask) await this.seekTask.catch(() => {});
+          return;
+        }
+        if (this.waitingRetry) {
+          resetRetry(this);
+          if (this.onRetry) this.onRetry();
+        }
+      }
+      this.stalled = false;
       await this.context.resume();
       this.paused = false;
       this.onUpdate();
@@ -656,6 +815,7 @@
     }
 
     pause() {
+      this.stalled = false;
       if (this.seeking) { this.resumeAfterSeek = false; return; }
       if (this.paused) return;
       this.anchorTime = this.currentTime;
@@ -665,12 +825,18 @@
       this.onUpdate();
     }
 
-    seek(time) {
+    /** resume：重试时（retry）指定之后是否继续播放；用户 Seek 时不传，同时作为立即重试 */
+    seek(time, resume) {
       if (!this.playlist) return;
       this.generation++;
       const gen = this.generation;
-      this.failed = false;
-      this.resumeAfterSeek = !this.paused || (this.seeking && this.resumeAfterSeek);
+      if (resume === undefined && this.waitingRetry) {
+        resetRetry(this);
+        if (this.onRetry) this.onRetry();
+      }
+      this.resumeAfterSeek = resume !== undefined ? resume
+        : !this.paused || this.stalled || (this.seeking && this.resumeAfterSeek);
+      this.stalled = false;
       this.seeking = true;
       this.paused = true;
       this.stopNodes();
@@ -694,10 +860,7 @@
           this.pump();
         }
       })().catch((error) => {
-        if (gen === this.generation && error.name !== 'AbortError') {
-          this.failed = true;
-          this.onError(error);
-        }
+        if (gen === this.generation && error.name !== 'AbortError') this.fail(error, 'seek', this.resumeAfterSeek);
         throw error;
       })
         .finally(() => { if (gen === this.generation) { this.seeking = false; this.seekTask = null; } });
@@ -720,6 +883,7 @@
     destroy() {
       this.generation++;
       clearInterval(this.timer);
+      resetRetry(this);
       if (this.controller) this.controller.abort();
       if (this.decoder) this.decoder.destroy();
       for (const node of this.nodes) { try { node.stop(); } catch {} node.disconnect(); }
@@ -889,18 +1053,21 @@
      * 预滚可能整段落在目标之前（没有输出），这时接着解下一段，排上音频才算完成，否则恢复播放后时钟会跑在音频前面
      */
     pump(first = false) {
-      if (this.busy || this.failed || !this.playlist || !this.decoder) return Promise.resolve();
+      if (this.busy || this.waitingRetry || !this.playlist || !this.decoder) return Promise.resolve();
       this.busy = true;
       const gen = this.generation;
       let ready = null;
+      let decoding = false;
       const started = first ? new Promise((resolve, reject) => { ready = { resolve, reject }; }) : null;
       const settle = () => { if (ready) { ready.resolve(); ready = null; } };
       const run = (async () => {
         const { segments } = this.playlist;
         while (this.nextIndex < segments.length && (first || segments[this.nextIndex].time < this.currentTime + 20)) {
           const seg = segments[this.nextIndex];
+          decoding = false;
           const encrypted = await this.playlist.load(seg, this.controller.signal);
           if (gen !== this.generation) return;
+          decoding = true;
           const decoded = await this.decoder.decode(encrypted, (part) => {
             if (gen !== this.generation || !part.samples) return;
             // Seek 后第一批从目标开始（之前的预滚已在 Worker 里丢掉），之后首尾相接
@@ -913,6 +1080,7 @@
           if (gen !== this.generation || decoded.aborted) return;
           this.nextIndex++;
           if (this.cursor !== null) first = false;
+          this.recovered();
           this.onUpdate();
         }
         if (this.nextIndex >= segments.length && !this.finished) {
@@ -930,11 +1098,7 @@
       })().catch((error) => {
         // 第一批之前出错交给调用方（换下一种播放方式或报错），之后的错误在这里报告
         if (ready && gen === this.generation) { ready.reject(error); ready = null; return; }
-        if (error.name !== 'AbortError' && gen === this.generation) {
-          this.failed = true;
-          this.pause();
-          this.onError(error);
-        }
+        if (error.name !== 'AbortError' && gen === this.generation) this.failLoading(error, decoding);
       }).finally(() => {
         this.busy = false;
         settle();
@@ -1028,10 +1192,8 @@
         if (this.scenes.length > 256) this.scenes.splice(0, this.scenes.length - 256);
       } else if (data.event === 'peak') {
         this.checkClip(data.peak);
-      } else if (data.event === 'error' && !this.failed) {
-        this.failed = true;
-        this.pause();
-        this.onError(new Error(data.error));
+      } else if (data.event === 'error' && !this.waitingRetry) {
+        this.failLoading(new Error(data.error), true);
       }
     }
 
@@ -1090,10 +1252,11 @@
      */
     pump(first = false) {
       if (!this.node) return super.pump(first);
-      if (this.busy || this.failed || !this.playlist || !this.decoder) return Promise.resolve();
+      if (this.busy || this.waitingRetry || !this.playlist || !this.decoder) return Promise.resolve();
       this.busy = true;
       const gen = this.generation;
       let ready = null;
+      let decoding = false;
       const started = first ? new Promise((resolve, reject) => { ready = { resolve, reject }; }) : null;
       if (first) {
         // 上一轮还没等到就又 Seek 了：让它结束（它的 Seek 已过时）
@@ -1110,13 +1273,16 @@
         const { segments } = this.playlist;
         while (this.nextIndex < segments.length && segments[this.nextIndex].time < this.currentTime + 20) {
           const seg = segments[this.nextIndex];
+          decoding = false;
           const encrypted = await this.playlist.load(seg, this.controller.signal);
           if (gen !== this.generation) return;
+          decoding = true;
           await this.decoder.decode(encrypted);
           if (gen !== this.generation) return;
           this.nextIndex++;
           const next = segments[this.nextIndex];
           this.loadedUntil = Math.max(this.loadedUntil, next ? next.time : this.duration || 0);
+          this.recovered();
           this.onUpdate();
         }
         if (this.nextIndex >= segments.length && !this.finished) {
@@ -1126,11 +1292,7 @@
       })().catch((error) => {
         // 第一批之前出错交给调用方（换下一种播放方式或报错），之后的错误在这里报告
         if (ready && gen === this.generation) { ready.reject(error); ready = null; return; }
-        if (error.name !== 'AbortError' && gen === this.generation) {
-          this.failed = true;
-          this.pause();
-          this.onError(error);
-        }
+        if (error.name !== 'AbortError' && gen === this.generation) this.failLoading(error, decoding);
       }).finally(() => {
         this.busy = false;
         // 换了一轮（Seek）：旧的等待不会再有 primed
@@ -1595,7 +1757,7 @@
           if (stale()) throw new DOMException('stale seek', 'AbortError');
           track.appendedSegments.add(target);
         }
-        this.failures = 0;
+        resetRetry(this);
         if (this.failed) {
           this.failed = false;
           if (this.onRecover) this.onRecover();
@@ -1603,24 +1765,10 @@
       } catch (err) {
         if (pumpSerial === this.pumpSerial && (!err || err.name !== 'AbortError')) {
           this.busy = false;
-          // 网络中断、wrapper-lite 暂不可用等错误：提示后自动重试，不让缓冲耗尽后一直卡住。
-          // 间隔从 3 秒起按连续失败次数翻倍，加 ±20% 抖动，避免故障期间所有客户端同步打过去；
-          // 重试 MAX_RETRIES 次仍失败后停止，等用户点「立即重试」（retryNow）
+          // 网络中断、wrapper-lite 暂不可用等错误：提示后自动重试（scheduleRetry），不让缓冲耗尽后一直卡住
           if (!this.failed && this.onError) this.onError(err);
           this.failed = true;
-          clearTimeout(this.retryTimer);
-          if (this.failures >= MAX_RETRIES) {
-            this.gaveUp = true;
-          } else {
-            const delay = 3000 * 2 ** this.failures * (0.8 + Math.random() * 0.4);
-            this.failures++;
-            this.retryAt = Date.now() + delay;
-            this.retryTimer = setTimeout(() => {
-              this.retryAt = null;
-              if (this.onRetry) this.onRetry();
-              this.pump(gen);
-            }, delay);
-          }
+          scheduleRetry(this, () => this.pump(gen));
           if (this.onRetry) this.onRetry();
           return;
         }
@@ -1634,10 +1782,7 @@
     /** 失败后立即重试，并重新计算自动重试次数 */
     retryNow() {
       if (!this.failed) return;
-      clearTimeout(this.retryTimer);
-      this.failures = 0;
-      this.retryAt = null;
-      this.gaveUp = false;
+      resetRetry(this);
       if (this.onRetry) this.onRetry();
       this.pump(this.generation);
     }
@@ -1666,9 +1811,7 @@
       this.stallLastTime = null;
       this.busy = false;
       this.failed = false;
-      this.failures = 0;
-      this.retryAt = null;
-      this.gaveUp = false;
+      resetRetry(this);
     }
   }
 
@@ -1761,10 +1904,13 @@
       this.bindUi();
       this.bindQueueUi();
       this.bindKeys(root.ownerDocument);
+      /** 音量滑块的值（0–1）；audio 元素上的实际音量还要乘 ALAC / AAC 的补偿，见 applyVolume */
+      this.volume = 1;
       try {
         const v = parseFloat(localStorage.getItem('am-hook:volume'));
-        if (v >= 0 && v <= 1) this.audio.volume = v;
+        if (v >= 0 && v <= 1) this.volume = v;
       } catch {}
+      this.applyVolume();
       this.renderVolume();
       if (global.AmI18n) global.AmI18n.onChange(() => this.renderLang());
     }
@@ -1974,6 +2120,7 @@
       const joc = jocSettings();
       const previous = this.jocMode;
       this.jocMode = joc.mode;
+      this.applyVolume();
       if (!c) return;
       if (isEc3(c.codecs)) {
         const pcm = this.pcm instanceof JocEngine ? this.pcm : null;
@@ -1995,6 +2142,16 @@
         }
       }
       this.renderMode();
+    }
+
+    /**
+     * 播放音质的设置或网络（Wi-Fi / 移动数据）变了（app.mjs）：当前曲目照常播完，从下一首起按新设置选音质；
+     * 已经为接续准备好的下一首按新设置重新准备
+     */
+    playbackChanged() {
+      if (!this.nextEntry) return;
+      this.nextEntry = null;
+      this.prepareNext();
     }
 
     /** 按当前设置重新选择播放方式，从当前位置继续播放当前曲目 */
@@ -2047,14 +2204,25 @@
 
     /** 音量 0–1，记在本地；喇叭图标的声波按音量显示 0–3 条 */
     setVolume(volume) {
-      this.audio.volume = volume;
-      if (this.pcm) this.pcm.gain.gain.value = volume;
+      this.volume = volume;
+      this.applyVolume();
       try { localStorage.setItem('am-hook:volume', String(volume)); } catch {}
       this.renderVolume();
     }
 
+    /**
+     * 把音量交给输出：PCM（EC-3 / JOC）用滑块的值；audio 元素播放 ALAC / AAC 时再乘设置中心的补偿（只衰减，不会削波），
+     * 让它与通常更小声的全景声接近。经 MSE 播放的 E-AC-3 不补偿。换曲目（含无缝接续）与设置变化时调用
+     */
+    applyVolume() {
+      const c = this.current;
+      const db = c && !isEc3(c.codecs) ? Number(jocSettings().stereoGain) || 0 : 0;
+      this.audio.volume = Math.min(1, Math.max(0, this.volume * 10 ** (Math.min(0, db) / 20)));
+      if (this.pcm) this.pcm.gain.gain.value = this.volume;
+    }
+
     renderVolume() {
-      const volume = this.audio.volume;
+      const volume = this.volume;
       const input = this.$('.volume');
       input.value = volume;
       input.style.setProperty('--volume', `${volume * 100}%`);
@@ -2112,8 +2280,8 @@
       volumeButton.addEventListener('pointerdown', (e) => { tapExpands = e.pointerType !== 'mouse' && !volume.classList.contains('expanded'); });
       volumeButton.addEventListener('click', () => {
         if (tapExpands) { tapExpands = false; expand(true); return; }
-        if (a.volume > 0) {
-          this.unmuteVolume = a.volume;
+        if (this.volume > 0) {
+          this.unmuteVolume = this.volume;
           this.setVolume(0);
         } else {
           this.setVolume(this.unmuteVolume || 0.5);
@@ -2728,6 +2896,7 @@
       this.queueSerial++;
       this.pendingTrack = null;
       this.current = { ...item, duration: this.mse.playlist.duration };
+      this.applyVolume();
       this.showError('');
       this.renderTrackText();
       this.renderArtwork(item);
@@ -2775,6 +2944,7 @@
       // 同一首歌切换音质时从当前位置继续；专辑页换曲（track 不同）从头播放
       const resumeAt = this.current && this.current.track === item.track ? this.transport().currentTime : 0;
       this.current = { ...item, mode: modes[0], duration: 0 };
+      this.applyVolume();
       this.show();
       this.showError('');
       this.renderTrackText();
@@ -2850,7 +3020,9 @@
             onClip: () => this.showError(() => t('player.jocClip')),
           });
         }
-        this.pcm.gain.gain.value = this.audio.volume;
+        this.pcm.gain.gain.value = this.volume;
+        this.pcm.onRecover = () => this.showError('');
+        this.pcm.onRetry = () => this.renderError();
         await this.pcm.load(item.m3u8Url);
         if (token !== this.playToken) return;
         this.current.duration = this.pcm.duration;
@@ -3003,27 +3175,28 @@
       const el = this.$('.player-msg');
       const msg = this.errorMsg;
       el.textContent = typeof msg === 'function' ? msg() : (msg || '');
-      // 分段加载失败（MseEngine 自动重试中或已停止）：错误后面显示重试状态与「立即重试」
-      const retrying = !!msg && !this.pcm && this.mse.failed;
+      // 分段加载失败（MseEngine / PcmEngine 自动重试中或已停止）：错误后面显示重试状态与「立即重试」
+      const engine = this.pcm || this.mse;
+      const retrying = !!msg && engine.failed;
       clearInterval(this.retryTick);
       if (retrying) {
         const status = document.createElement('span');
         status.className = 'player-retry-status';
         el.append(' ', status);
         const update = () => {
-          const { retryAt, gaveUp } = this.mse;
+          const { retryAt, gaveUp } = engine;
           status.textContent = gaveUp ? t('player.retryStopped')
             : retryAt ? t('player.retryIn', { s: Math.max(1, Math.ceil((retryAt - Date.now()) / 1000)) })
             : t('player.retrying');
         };
         update();
-        if (this.mse.retryAt) this.retryTick = setInterval(update, 1000);
-        if (this.mse.retryAt || this.mse.gaveUp) {
+        if (engine.retryAt) this.retryTick = setInterval(update, 1000);
+        if (engine.retryAt || engine.gaveUp) {
           const button = document.createElement('button');
           button.type = 'button';
           button.className = 'player-retry';
           button.textContent = t('player.retryNow');
-          button.addEventListener('click', () => this.mse.retryNow());
+          button.addEventListener('click', () => engine.retryNow());
           el.append(' ', button);
         }
       }
@@ -3032,7 +3205,7 @@
     }
   }
 
-  const api = { AmPlayer, Marquee, artistNodes, qualityBadge, qualityIcon, segmentAt, formatTime, detectMode, detectModes, mimeFor, useJocSettings };
-  if (typeof module !== 'undefined' && module.exports) module.exports = { ...api, MseEngine, JocEngine, JocLiveEngine, sortVariants };
+  const api = { AmPlayer, Marquee, artistNodes, qualityBadge, qualityIcon, segmentAt, formatTime, detectMode, detectModes, mimeFor, useJocSettings, usePlaybackSettings };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { ...api, MseEngine, PcmEngine, JocEngine, JocLiveEngine, sortVariants, pickPlayable };
   else global.AmHook = api;
 })(typeof window !== 'undefined' ? window : globalThis);
