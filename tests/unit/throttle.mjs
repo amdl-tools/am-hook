@@ -9,7 +9,7 @@ globalThis.window = globalThis;
 globalThis.addEventListener ??= () => {};
 globalThis.location = { origin: 'http://localhost' };
 globalThis.localStorage = { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, String(v)) };
-globalThis.AmI18n = { t: (key) => key, storefront: 'cn', catalogLang: async () => undefined };
+globalThis.AmI18n = { t: (key) => key, storefront: 'cn', regions: ['cn'], catalogLang: async () => undefined };
 globalThis.AmDecrypt = {};
 
 // 桩掉的网络：amp-api 补充元数据返回空；/parse/song/<id>（服务端转发 wrapper-lite 的 /m3u8）由 behavior 决定
